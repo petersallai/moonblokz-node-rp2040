@@ -305,9 +305,11 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
     log::info!("Node {} booting the blockchain", own_node_id);
     BOOTED.signal(());
 
+    // The blockchain borrows the storage, which stays in this task's future
+    // once instead of being moved into every async layer (Story 12.1 AC7).
     moonblokz_node_runtime::run::<
         Crypto,
-        NodeStorage,
+        &mut NodeStorage,
         CriticalSectionRawMutex,
         1,
         MAX_NODES,
@@ -317,7 +319,7 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
         MAX_BLOCK_UTXO_OUTPUT,
     >(
         crypto,
-        storage,
+        &mut storage,
         own_node_id,
         NODE_ZERO_PUBLIC_KEY,
         prng_seed,
