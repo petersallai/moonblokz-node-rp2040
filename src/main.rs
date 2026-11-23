@@ -127,74 +127,112 @@ fn command_text(bytes: &[u8; rp_usb_console::USB_READ_BUFFER_SIZE]) -> Option<&s
 }
 
 /// Waits for a `/I_<node_id>_<private_key_hex>_` command and writes the node's
-/// identity to the storage control plane. Returns once it is stored. The key
-/// is checked with the scheme's `Crypto::new` first (DEC-294).
+/// identity to the storage control plane. Returns once it is stored.
 async fn wait_for_initialization(storage: &mut NodeStorage) {
     loop {
         let command_bytes = COMMAND_CHANNEL.receive().await;
-        let Some(trimmed) = command_text(&command_bytes) else {
-            continue;
-        };
-        if !trimmed.starts_with("/I_") {
-            continue;
+        if provision(storage, &command_bytes) {
+            return;
         }
-        let param0 = parse_command_parameter(trimmed, 0);
-        let param1 = parse_command_parameter(trimmed, 1);
+    }
+}
 
-        match (param0, param1) {
-            (Some(node_id_str), Some(key_hex)) => {
-                let node_id = match node_id_str.parse::<u32>() {
-                    Ok(id) => id,
-                    Err(_) => {
-                        log::warn!("Failed to parse node_id: {}", node_id_str);
-                        continue;
-                    }
-                };
-                let mut private_key = [0u8; PRIVATE_KEY_SIZE];
-                if key_hex.len() != 2 * PRIVATE_KEY_SIZE {
-                    log::warn!(
-                        "Private key hex must be {} characters, got {}",
-                        2 * PRIVATE_KEY_SIZE,
-                        key_hex.len()
-                    );
-                    continue;
-                }
-                let mut valid = true;
-                let key_bytes = key_hex.as_bytes();
-                let mut i = 0;
-                while i < PRIVATE_KEY_SIZE {
-                    let hi = hex_nibble(key_bytes[i * 2]);
-                    let lo = hex_nibble(key_bytes[i * 2 + 1]);
-                    if let (Some(h), Some(l)) = (hi, lo) {
-                        private_key[i] = (h << 4) | l;
-                    } else {
-                        valid = false;
-                        break;
-                    }
-                    i += 1;
-                }
-                if !valid {
-                    log::warn!("Invalid hex in private key");
-                    continue;
-                }
-                if Crypto::new(private_key).is_err() {
-                    log::warn!("The private key is not a valid key for this signature scheme");
-                    continue;
-                }
-                match storage.init(private_key, node_id, [0u8; INIT_PARAMS_SIZE]) {
-                    Ok(()) => {
-                        log::info!("Node {} initialized", node_id);
-                        return;
-                    }
-                    Err(_) => log::error!("Failed to store the node identity"),
-                }
-            }
+/// Handles one console line during provisioning; `true` once the identity is
+/// stored. The key is checked with the scheme's `Crypto::new` first (DEC-294).
+///
+/// Out of line, like [`load_identity`], so its temporaries do not sit in the
+/// blockchain task's poll frame under every later blockchain call.
+#[inline(never)]
+fn provision(
+    storage: &mut NodeStorage,
+    command_bytes: &[u8; rp_usb_console::USB_READ_BUFFER_SIZE],
+) -> bool {
+    let Some(trimmed) = command_text(command_bytes) else {
+        return false;
+    };
+    if !trimmed.starts_with("/I_") {
+        return false;
+    }
+    let (Some(node_id_str), Some(key_hex)) = (
+        parse_command_parameter(trimmed, 0),
+        parse_command_parameter(trimmed, 1),
+    ) else {
+        log::warn!(
+            "Received initialization command with insufficient parameters: {}",
+            trimmed
+        );
+        return false;
+    };
+    let Ok(node_id) = node_id_str.parse::<u32>() else {
+        log::warn!("Failed to parse node_id: {}", node_id_str);
+        return false;
+    };
+    if key_hex.len() != 2 * PRIVATE_KEY_SIZE {
+        log::warn!(
+            "Private key hex must be {} characters, got {}",
+            2 * PRIVATE_KEY_SIZE,
+            key_hex.len()
+        );
+        return false;
+    }
+    let mut private_key = [0u8; PRIVATE_KEY_SIZE];
+    let key_bytes = key_hex.as_bytes();
+    for (i, byte) in private_key.iter_mut().enumerate() {
+        match (
+            hex_nibble(key_bytes[i * 2]),
+            hex_nibble(key_bytes[i * 2 + 1]),
+        ) {
+            (Some(h), Some(l)) => *byte = (h << 4) | l,
             _ => {
-                log::warn!(
-                    "Received initialization command with insufficient parameters: {}",
-                    trimmed
-                );
+                log::warn!("Invalid hex in private key");
+                return false;
             }
+        }
+    }
+    if Crypto::new(private_key).is_err() {
+        log::warn!("The private key is not a valid key for this signature scheme");
+        return false;
+    }
+    match storage.init(private_key, node_id, [0u8; INIT_PARAMS_SIZE]) {
+        Ok(()) => {
+            log::info!("Node {} initialized", node_id);
+            true
+        }
+        Err(_) => {
+            log::error!("Failed to store the node identity");
+            false
+        }
+    }
+}
+
+/// Reads `own_node_id` and the signing key from the control plane and builds
+/// the crypto instance; the key goes straight into it and is not kept (FR68).
+/// `None` (logged) sends the node back to provisioning.
+///
+/// Both control-plane reads run here, on Core 0, before the storage moves into
+/// the blockchain, so any replica repair they write happens on the core that
+/// may write flash. Out of line, so the control-plane data (about 2 KB) does
+/// not sit in the blockchain task's poll frame.
+#[inline(never)]
+fn load_identity(storage: &mut NodeStorage) -> Option<(u32, Crypto)> {
+    let own_node_id = match storage.load_control_data() {
+        Ok(control) => control.own_node_id,
+        Err(error) => {
+            log_load_error(&error);
+            return None;
+        }
+    };
+    match storage
+        .load_private_key()
+        .ok()
+        .and_then(|key| Crypto::new(key).ok())
+    {
+        Some(crypto) => Some((own_node_id, crypto)),
+        None => {
+            log::error!(
+                "The stored signing key is unusable; waiting for /I_<node_id>_<private_key>_"
+            );
+            None
         }
     }
 }
@@ -255,25 +293,9 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
         }
     };
 
-    // Both control-plane reads run here, on Core 0, before the storage moves
-    // into the blockchain, so any replica repair they write happens on the
-    // core that may write flash. The key goes straight into the crypto module
-    // and is not kept (FR68).
     let (own_node_id, crypto) = loop {
-        match storage.load_control_data() {
-            Ok(control) => {
-                match storage
-                    .load_private_key()
-                    .ok()
-                    .and_then(|key| Crypto::new(key).ok())
-                {
-                    Some(crypto) => break (control.own_node_id, crypto),
-                    None => log::error!(
-                        "The stored signing key is unusable; waiting for /I_<node_id>_<private_key>_"
-                    ),
-                }
-            }
-            Err(error) => log_load_error(&error),
+        if let Some(identity) = load_identity(&mut storage) {
+            break identity;
         }
         wait_for_initialization(&mut storage).await;
     };

@@ -4,16 +4,22 @@
 Measures one workspace (a directory holding the `moonblokz-*` sibling crates):
 
 * the `moonblokz-node-rp2040` release firmware: flash (`.vector_table` + `.boot2` +
-  `.text` + `.rodata` + `.data`), static RAM (`.data` + `.bss`), and the Core 1
-  stack reservation (`CORE1_STACK`, which hosts the blockchain task);
+  `.text` + `.rodata` + `.data`), static RAM (`.data` + `.bss` + `.uninit`), the
+  Core 1 stack reservation (`CORE1_STACK`), and, once the node runs the chain
+  (Story 12.1), the blockchain task's pool (`blockchain_task::POOL`: the
+  `Blockchain` in its task future plus the by-value arguments) and the
+  blockchain task's worst-case stack, read from the node ELF from the task's
+  poll function. The blockchain task runs on Core 0's main stack (DEC-289);
 * the footprint probe (moonblokz-node-rp2040/tools/footprint/probe): the blockchain stack at the
   architecture 5 defaults, built with and without the blockchain, for the
   blockchain's flash and static RAM and its worst-case stack per API entry
   point (prologue frames summed along the deepest call path, stack_depth.py).
 
-While the node firmware does not instantiate the blockchain (O-020), the node
-estimate adds the probe's blockchain delta to the node build. "Other RAM" is
-static RAM without the Core 1 stack reservation.
+A node that does not link the blockchain (a base workspace before Story 12.1)
+is estimated as before: the probe's blockchain delta is added and the Core 1
+stack hosts the blockchain task. "Other RAM" is static RAM without the Core 1
+stack reservation. The node build needs the anchor and genesis-config files
+(DEC-291, DEC-292); the tool writes scheme-sized dummies.
 
     footprint.py                         measure the live workspace
     footprint.py --scheme S              ... built for signature scheme S
@@ -41,10 +47,27 @@ ESTIMATED_ROWS = {
     "mempool (not linked yet)": 24883,     # about 24.3 KB
     "radio-lib memory-config-medium": 60 * 1024,
     "crypto-lib scratch": 4 * 1024,
+    # The former 18 KiB "other task stacks" less the 8 KiB CORE1_STACK that
+    # .bss now holds: the radio tasks will share Core 1's stack (DEC-289).
+    # The storage page buffer is measured inside the blockchain task's pool.
+    "Core 1 radio tasks (not linked yet)": 10 * 1024,
+}
+# Before Story 12.1 (a node that does not link the blockchain).
+LEGACY_ROWS = {
+    "mempool (not linked yet)": 24883,
+    "radio-lib memory-config-medium": 60 * 1024,
+    "crypto-lib scratch": 4 * 1024,
     "storage page buffer": 4 * 1024,
     "other task stacks": 18 * 1024,
 }
-CORE1_MARGIN = 1.25  # DEC-137: Core 1 >= 1.25 x the deepest root
+CORE1_MARGIN = 1.25  # DEC-137: the blockchain stack >= 1.25 x the deepest root
+PUBLIC_KEY_SIZE = {None: 32, "schnorr": 32, "bls-min-sig": 96, "bls-min-pk": 48}
+# The node's task polls. The blockchain task's poll is usually inlined into
+# its `TaskStorage<F>::poll`, so every task poll is a root and the deepest one
+# counts (conservative: the other tasks are far shallower).
+NODE_ROOTS = re.compile(
+    r"^[0-9a-f]+ <(\S*(?:TaskStorage\$LT\$F\$GT\$4poll|__blockchain_task_task_inner_function\S*closure)\S*)>:$",
+    re.M)
 FIT_POINTS = (200, 300)  # node counts the per-node static RAM is measured at
 ROOTS = ["probe_receive", "probe_restart", "probe_genesis", "probe_tick", "probe_support"]
 ENTRY = {"probe_receive": "receive_block", "probe_restart": "initialize_from_storage",
@@ -80,17 +103,43 @@ def flash_of(s):
     return sum(s.get(k, 0) for k in (".vector_table", ".boot2", ".text", ".rodata", ".data"))
 
 
+def baked_files(scratch, scheme):
+    """Dummy anchor (scheme-sized) and genesis-config files for the node build."""
+    os.makedirs(scratch, exist_ok=True)
+    anchor = os.path.join(scratch, "node-zero.pk")
+    config = os.path.join(scratch, "genesis-config.bin")
+    with open(anchor, "wb") as fh:
+        fh.write(bytes(PUBLIC_KEY_SIZE[scheme]))
+    with open(config, "wb") as fh:
+        fh.write(bytes(2))
+    return {"MOONBLOKZ_NODE_ZERO_PUBLIC_KEY": anchor, "MOONBLOKZ_GENESIS_CHAIN_CONFIG": config}
+
+
 def measure(ws, scratch, scheme=None):
     # `scheme=None` builds with each crate's defaults (the base workspace).
     flags = ["--no-default-features", "--features", scheme] if scheme else []
-    env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(scratch, "target-node"))
+    env = dict(os.environ, CARGO_TARGET_DIR=os.path.join(scratch, "target-node"),
+               **baked_files(scratch, scheme))
     node_dir = os.path.join(ws, "moonblokz-node-rp2040")
     run(["cargo", "build", "--release"] + flags, node_dir, env)
     elf = os.path.join(scratch, "target-node", "thumbv6m-none-eabi", "release", "moonblokz-node-rp2040")
     s = sections(elf)
-    node = {"flash": flash_of(s), "ram_static": s.get(".data", 0) + s.get(".bss", 0),
+    node = {"flash": flash_of(s),
+            "ram_static": s.get(".data", 0) + s.get(".bss", 0) + s.get(".uninit", 0),
             "core1_stack": symbol_size(elf, r"CORE1_STACK"),
-            "links_blockchain": symbol_size(elf, r"moonblokz_blockchain") > 0}
+            "links_blockchain": symbol_size(elf, r"moonblokz_blockchain") > 0,
+            "chain_pool": symbol_size(elf, r"::blockchain_task::POOL$"),
+            "peak": 0}
+    if node["chain_pool"]:
+        listing = run(["arm-none-eabi-objdump", "-d", "--no-show-raw-insn", elf], "/")
+        roots = sorted(set(NODE_ROOTS.findall(listing)))
+        if not roots:
+            sys.exit("node ELF: no task poll function found")
+        ndis = os.path.join(scratch, "node.dis")
+        with open(ndis, "w") as fh:
+            fh.write(listing)
+        out = run([sys.executable, "-I", os.path.join(HERE, "stack_depth.py"), ndis] + roots, "/")
+        node["peak"] = max(int(n) for n in re.findall(r"worst-case (\d+) B", out))
 
     probe = os.path.join(scratch, "probe")
     shutil.copytree(os.path.join(HERE, "probe"), probe, dirs_exist_ok=True)
@@ -120,12 +169,13 @@ def measure(ws, scratch, scheme=None):
 
     add = not node["links_blockchain"]
     other = node["ram_static"] - node["core1_stack"] + (bc["ram"] if add else 0)
-    budget = fit(scheme, probe, penv, pelf, node, bc, stack) if scheme and add else None
+    budget = fit(scheme, probe, penv, pelf, node, bc, stack) if scheme else None
     return {"node": node, "blockchain": bc, "budget": budget,
             "estimate": {"flash": node["flash"] + (bc["flash"] if add else 0),
                          "ram_other": other,
                          "stack_reserved": node["core1_stack"],
-                         "stack_peak": max(stack.values()) if stack else 0,
+                         "stack_peak": node["peak"] if node["peak"] else
+                         (max(stack.values()) if stack else 0),
                          "blockchain_added": add}}
 
 
@@ -138,16 +188,36 @@ def fit(scheme, probe, penv, pelf, node, bc, stack):
         slots.append(symbol_size(pelf, r"\bSLOT\b"))
     per_node = (slots[1] - slots[0]) // (FIT_POINTS[1] - FIT_POINTS[0])
     core1 = node["core1_stack"]
-    # The node's static RAM already holds its Core 1 stack and the executor statics.
-    fixed = node["ram_static"] + sum(ESTIMATED_ROWS.values())
-    total = bc["ram"] + fixed
-    peak = max(stack.values()) if stack else 0
+    if not node["links_blockchain"]:
+        # Before Story 12.1: the blockchain task runs on the Core 1 stack, which
+        # the node's static RAM already holds; the probe's SLOT is added.
+        fixed = node["ram_static"] + sum(LEGACY_ROWS.values())
+        total = bc["ram"] + fixed
+        peak = max(stack.values()) if stack else 0
+        return {"limit": RAM_LIMIT, "total": total, "margin": RAM_LIMIT - total,
+                "estimated_rows": LEGACY_ROWS,
+                "slot_per_node": per_node,
+                "max_nodes_fit": FIT_POINTS[0] + (RAM_LIMIT - fixed - slots[0]) // per_node,
+                "core1_required": math.ceil(peak * CORE1_MARGIN / 1024) * 1024,
+                "core1_ok": core1 >= peak * CORE1_MARGIN}
+    # Story 12.1 (DEC-289): the blockchain task runs on Core 0's main stack,
+    # the RAM above static RAM. Static RAM holds CORE1_STACK and the task pool.
+    pool = node["chain_pool"]
+    estimates = sum(ESTIMATED_ROWS.values())
+    stack_required = math.ceil(node["peak"] * CORE1_MARGIN)
+    total = node["ram_static"] + estimates + stack_required
+    # The pool scales with MAX_NODES through the Blockchain only; the rest of it
+    # (the by-value arguments) is fixed.
+    pool_overhead = pool - bc["ram"]
+    fixed = node["ram_static"] - pool + pool_overhead + estimates + stack_required
     return {"limit": RAM_LIMIT, "total": total, "margin": RAM_LIMIT - total,
             "estimated_rows": ESTIMATED_ROWS,
+            "chain_pool": pool, "pool_overhead": pool_overhead,
+            "main_stack_available": RAM_LIMIT - node["ram_static"] - estimates,
+            "stack_required": stack_required,
+            "stack_ok": RAM_LIMIT - node["ram_static"] - estimates >= stack_required,
             "slot_per_node": per_node,
-            "max_nodes_fit": FIT_POINTS[0] + (RAM_LIMIT - fixed - slots[0]) // per_node,
-            "core1_required": math.ceil(peak * CORE1_MARGIN / 1024) * 1024,
-            "core1_ok": core1 >= peak * CORE1_MARGIN}
+            "max_nodes_fit": FIT_POINTS[0] + (RAM_LIMIT - fixed - slots[0]) // per_node}
 
 
 def base_workspace(spec, scratch):
@@ -182,7 +252,7 @@ def delta(a, b):
 def table(before, after):
     rows = [("Binary size (flash, estimated node)", "flash"),
             ("RAM without stack (static, estimated node)", "ram_other"),
-            ("Stack: Core 1 reservation (blockchain task)", "stack_reserved"),
+            ("Stack: Core 1 reservation", "stack_reserved"),
             ("Stack: blockchain worst-case peak", "stack_peak")]
     out = ["| Metric | Before | After | Change |", "|---|---:|---:|---:|"]
     for label, key in rows:
