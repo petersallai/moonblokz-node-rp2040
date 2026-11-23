@@ -69,14 +69,16 @@ impl StorageTrait for Opaque {
 /// plus 50 / 114 / 66 B a node), its Core 1 stack and the rest of system
 /// constraints §3.2 fit 264 KB (Story 6.17, DEC-254; re-fitted by Story 6.6
 /// for the approval accumulator, and by Story 6.7 for `bls-min-sig`'s Core 1
-/// of 57 KiB, DEC-263). `footprint.py --scheme` checks the fit and
-/// prints the largest count (`budget.max_nodes_fit`).
+/// of 57 KiB, DEC-263), and by Story 12.1 against the node's own build (the
+/// real storage, the blockchain task on Core 0). `footprint.py --scheme`
+/// checks the fit and prints the largest count (`budget.max_nodes_fit`).
+/// Keep in step with the node's `MAX_NODES` (`src/main.rs`).
 #[cfg(feature = "schnorr")]
-const PROFILE_MAX_NODES: usize = 1000;
+const PROFILE_MAX_NODES: usize = 800;
 #[cfg(feature = "bls-min-sig")]
-const PROFILE_MAX_NODES: usize = 258;
+const PROFILE_MAX_NODES: usize = 240;
 #[cfg(feature = "bls-min-pk")]
-const PROFILE_MAX_NODES: usize = 211;
+const PROFILE_MAX_NODES: usize = 95;
 
 /// The profile's count, or `FOOTPRINT_MAX_NODES` when `footprint.py` sets it.
 #[cfg(feature = "with-chain")]

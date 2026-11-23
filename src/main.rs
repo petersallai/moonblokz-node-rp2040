@@ -48,14 +48,18 @@ const NODE_ZERO_PUBLIC_KEY: [u8; PUBLIC_KEY_SIZE] =
 /// The genesis chain-config content, used only by node #0's `/G_` (DEC-292).
 static GENESIS_CHAIN_CONFIG: &[u8] = include_bytes!(env!("MOONBLOKZ_GENESIS_CHAIN_CONFIG"));
 
-// The capacity profile per scheme (DEC-254): the largest `MAX_NODES` whose
-// static RAM and stacks fit 264 KB, beside the architecture §5 defaults.
+// The capacity profile per scheme (DEC-254): a `MAX_NODES` whose static RAM and
+// stacks fit 264 KB, beside the architecture §5 defaults. Re-fitted by Story
+// 12.1, the first measurement with the real rp2040 storage and the blockchain
+// task on Core 0 (largest fits 816 / 248 / 99, kept a little below); the
+// follow-up stack-diet story aims to restore 1000 / 258 / 211. Keep in step
+// with the footprint probe's `PROFILE_MAX_NODES`.
 #[cfg(feature = "schnorr")]
-const MAX_NODES: usize = 1000;
+const MAX_NODES: usize = 800;
 #[cfg(feature = "bls-min-sig")]
-const MAX_NODES: usize = 258;
+const MAX_NODES: usize = 240;
 #[cfg(feature = "bls-min-pk")]
-const MAX_NODES: usize = 211;
+const MAX_NODES: usize = 95;
 const SNAKE_CHAIN_LENGTH_MAX: u32 = 500;
 const MAX_BLOCKS: usize = 600;
 const MAX_BRANCH_COUNT: usize = 40;
