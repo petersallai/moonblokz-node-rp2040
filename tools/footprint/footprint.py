@@ -188,7 +188,8 @@ def measure(ws, scratch, scheme=None):
 
 
 def fit(scheme, probe, penv, pelf, node, bc, stack):
-    """The 264 KB inequality, the Core 1 gate and the largest MAX_NODES that fits."""
+    """The 264 KB inequality, the blockchain stack gate (Core 1 before Story 12.1,
+    Core 0's main stack since) and the largest MAX_NODES that fits."""
     slots = []
     for n in FIT_POINTS:
         run(["cargo", "build", "--release", "--no-default-features", "--features",
@@ -294,6 +295,11 @@ def main():
         after["scheme"] = args.scheme
         if not args.base:
             print(json.dumps(after, indent=2))
+            gate = after["budget"] or {}
+            if gate.get("margin", 0) < 0 or gate.get("stack_ok") is False or gate.get("core1_ok") is False:
+                # The measurement is printed; the gate itself fails the run.
+                sys.exit("footprint gate failed: margin %s B, stack_ok %s" %
+                         (gate.get("margin"), gate.get("stack_ok", gate.get("core1_ok"))))
             return
         ws, trees = base_workspace(args.base, scratch)
         before = measure(ws, os.path.join(scratch, "before"))

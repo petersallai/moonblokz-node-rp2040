@@ -43,7 +43,7 @@ Convert `target/thumbv6m-none-eabi/release/moonblokz-node-rp2040` to UF2 (for ex
 
 ## Recovery
 
-A node that cannot serve its stored chain says so in its boot log (`boot: Rejected(...)`, or `Control plane unreadable (...)` before provisioning). The usual cause is a firmware that does not match the stored chain: another anchor, signature scheme or block-size tier, or a `MAX_NODES` below the chain's node cap. **Flash the matching build**; nothing is lost. Only when the stored data is truly unusable, send `/E_` and then `/I_`: that erases all storage, the chain included. A Core 0 stack overflow halts the node (HardFault); power-cycle it.
+A node that cannot serve its stored chain says so in its boot log (`boot: Rejected(...)`, or `Control plane unreadable (...)` before provisioning). The usual cause is a firmware that does not match the stored chain: another anchor, signature scheme or block-size tier, or a `MAX_NODES` below the chain's node cap. **Flash the matching build**; nothing is lost. Only when the stored data is truly unusable, start over: before provisioning (an unreadable control plane), send `/E_` and then `/I_`; after a boot that reports `boot: Rejected(...)` the console does not accept `/E_`, so erase the flash (for example `picotool erase`) and provision again. Either way all storage, the chain included, is lost. A Core 0 stack overflow halts the node (HardFault); power-cycle it.
 
 ## Hardware run (Story 12.1 AC8)
 

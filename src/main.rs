@@ -51,7 +51,7 @@ static GENESIS_CHAIN_CONFIG: &[u8] = include_bytes!(env!("MOONBLOKZ_GENESIS_CHAI
 // The capacity profile per scheme (DEC-254): a `MAX_NODES` whose static RAM and
 // stacks fit 264 KB, beside the architecture §5 defaults. Re-fitted by Story
 // 12.1, the first measurement with the real rp2040 storage and the blockchain
-// task on Core 0 (largest fits 816 / 248 / 99, kept a little below); the
+// task on Core 0 (largest fits 815 / 247 / 98 after the code review, kept a little below); the
 // follow-up stack-diet story aims to restore 1000 / 258 / 211. Keep in step
 // with the footprint probe's `PROFILE_MAX_NODES`.
 #[cfg(feature = "schnorr")]
