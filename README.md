@@ -37,8 +37,23 @@ Convert `target/thumbv6m-none-eabi/release/moonblokz-node-rp2040` to UF2 (for ex
 
 | Command | When | Effect |
 |---|---|---|
-| `/I_<node_id>_<private_key_hex>_` | the control plane is uninitialized or unreadable | Stores the node identity. The key (64 hex digits) is checked for the scheme first (DEC-294). |
-| `/G_<initial_total_network_currency>_` | node #0, booted on empty storage | Founds the chain (FR54): blocks #0 and #1. Refused anywhere else (DEC-292). |
+| `/I_<node_id>_<private_key_hex>_` | not provisioned | Erases all storage and stores the node identity. The key (64 hex digits) is checked for the scheme first (DEC-294). Accepted at once on an uninitialized control plane; otherwise only after `/E_`. |
+| `/E_` | the control plane holds data this firmware cannot use | Arms the erase: the next `/I_` may erase all storage, the stored chain included. |
+| `/G_<initial_total_network_currency>_` | node #0, booted on empty storage | Founds the chain (FR54): blocks #0 and #1. The currency must be positive. Refused anywhere else (DEC-292). |
+
+## Recovery
+
+A node that cannot serve its stored chain says so in its boot log (`boot: Rejected(...)`, or `Control plane unreadable (...)` before provisioning). The usual cause is a firmware that does not match the stored chain: another anchor, signature scheme or block-size tier, or a `MAX_NODES` below the chain's node cap. **Flash the matching build**; nothing is lost. Only when the stored data is truly unusable, send `/E_` and then `/I_`: that erases all storage, the chain included. A Core 0 stack overflow halts the node (HardFault); power-cycle it.
+
+## Hardware run (Story 12.1 AC8)
+
+Build each scheme with `,stack-report` and watch the USB log.
+
+1. **A node other than #0.** Flash it and send `/I_<id>_<key>_`. After `Node <id> initialized` the boot continues without a reboot: `Node <id> booting the blockchain`, then `boot: StartedCollecting`. With no radio there is no Stored head, so no tick follows (`NextCall::Idle`).
+2. **Node #0.** Flash it with the anchor and genesis-config files made from node #0's key, send `/I_0_<key>_`, wait for `boot: StartedCollecting`, then send `/G_<currency>_`. It logs `genesis: block #0 [..], block #1 [..]`. This is the first real flash write by the blockchain.
+3. **Reboot node #0.** It logs `boot: ResumedReady` with no `BackendIo`. A `/G_` now logs `genesis refused: not node #0 booted on empty storage`.
+4. **Stacks.** Every 5 s the node logs `stack high-water: core0 <n> B, core1 <m> B of 8192`, and `core1 heartbeat` keeps arriving while Core 0 computes during `/G_`. Record the highest marks per scheme against `footprint.py`'s `stack_required` (Core 0) and the 8 KiB `CORE1_STACK`.
+5. **Record** the outcomes, the marks, and the boot-to-`boot:` latency (O-023) in the story's Dev Agent Record.
 
 ## Footprint
 
