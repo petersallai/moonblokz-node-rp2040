@@ -129,7 +129,10 @@ def measure(ws, scratch, scheme=None):
             "core1_stack": symbol_size(elf, r"CORE1_STACK"),
             "links_blockchain": symbol_size(elf, r"moonblokz_blockchain") > 0,
             "chain_pool": symbol_size(elf, r"::blockchain_task::POOL$"),
-            "peak": 0}
+            "peak": 0, "poll_frame": 0}
+    if node["links_blockchain"] and not node["chain_pool"]:
+        # Fail closed: without the pool the peak and the gate would read 0.
+        sys.exit("node ELF links the blockchain but blockchain_task::POOL was not found")
     if node["chain_pool"]:
         listing = run(["arm-none-eabi-objdump", "-d", "--no-show-raw-insn", elf], "/")
         roots = sorted(set(NODE_ROOTS.findall(listing)))
@@ -139,7 +142,12 @@ def measure(ws, scratch, scheme=None):
         with open(ndis, "w") as fh:
             fh.write(listing)
         out = run([sys.executable, "-I", os.path.join(HERE, "stack_depth.py"), ndis] + roots, "/")
-        node["peak"] = max(int(n) for n in re.findall(r"worst-case (\d+) B", out))
+        # Per root: the worst case and the root's own frame (the first path
+        # line), i.e. the task poll frame with the argument copies on the peak.
+        found = re.findall(r"worst-case (\d+) B\n\s+(\d+)\s", out)
+        if not found:
+            sys.exit("stack_depth.py produced no result for the node ELF")
+        node["peak"], node["poll_frame"] = max((int(d), int(f)) for d, f in found)
 
     probe = os.path.join(scratch, "probe")
     shutil.copytree(os.path.join(HERE, "probe"), probe, dirs_exist_ok=True)
@@ -209,10 +217,14 @@ def fit(scheme, probe, penv, pelf, node, bc, stack):
     # The pool scales with MAX_NODES through the Blockchain only; the rest of it
     # (the by-value arguments) is fixed.
     pool_overhead = pool - bc["ram"]
+    if not 0 <= pool_overhead <= 16 * 1024:
+        sys.exit("pool overhead %d B is implausible: do the probe's PROFILE_MAX_NODES and the "
+                 "node's MAX_NODES differ?" % pool_overhead)
     fixed = node["ram_static"] - pool + pool_overhead + estimates + stack_required
     return {"limit": RAM_LIMIT, "total": total, "margin": RAM_LIMIT - total,
             "estimated_rows": ESTIMATED_ROWS,
             "chain_pool": pool, "pool_overhead": pool_overhead,
+            "task_poll_frame": node["poll_frame"],
             "main_stack_available": RAM_LIMIT - node["ram_static"] - estimates,
             "stack_required": stack_required,
             "stack_ok": RAM_LIMIT - node["ram_static"] - estimates >= stack_required,
@@ -252,8 +264,10 @@ def delta(a, b):
 def table(before, after):
     rows = [("Binary size (flash, estimated node)", "flash"),
             ("RAM without stack (static, estimated node)", "ram_other"),
-            ("Stack: Core 1 reservation", "stack_reserved"),
-            ("Stack: blockchain worst-case peak", "stack_peak")]
+            ("Stack: Core 1 reservation (blockchain task before Story 12.1; USB / radio since)",
+             "stack_reserved"),
+            ("Stack: blockchain peak (probe entry max before Story 12.1; node task poll since)",
+             "stack_peak")]
     out = ["| Metric | Before | After | Change |", "|---|---:|---:|---:|"]
     for label, key in rows:
         a, b = before["estimate"][key], after["estimate"][key]

@@ -123,26 +123,42 @@ fn parse_command_parameter(command: &str, parameter_index: usize) -> Option<&str
     }
 }
 
-/// The trimmed text of a console line, or `None` if it is not UTF-8.
+/// The trimmed text of a console line, or `None` if it is not UTF-8. The
+/// console reuses its line buffer, so the bytes after the first NUL are stale.
 fn command_text(bytes: &[u8; rp_usb_console::USB_READ_BUFFER_SIZE]) -> Option<&str> {
-    core::str::from_utf8(bytes)
-        .ok()
-        .map(|text| text.trim_matches(char::from(0)).trim())
+    let line = bytes.split(|byte| *byte == 0).next().unwrap_or(&[]);
+    core::str::from_utf8(line).ok().map(str::trim)
+}
+
+/// What one provisioning console line did.
+enum Provision {
+    Stored,
+    EraseArmed,
+    Ignored,
 }
 
 /// Waits for a `/I_<node_id>_<private_key_hex>_` command and writes the node's
 /// identity to the storage control plane. Returns once it is stored.
-async fn wait_for_initialization(storage: &mut NodeStorage) {
+///
+/// `/I_` erases the whole storage region. When the control plane holds data
+/// this firmware cannot use (`erase_armed` false), usually because the firmware
+/// does not match the stored chain, `/I_` is refused until `/E_` confirms the
+/// erase: flashing the matching build recovers the node without losing the
+/// chain (Story 12.1 DN1).
+async fn wait_for_initialization(storage: &mut NodeStorage, mut erase_armed: bool) {
     loop {
         let command_bytes = COMMAND_CHANNEL.receive().await;
-        if provision(storage, &command_bytes) {
-            return;
+        match provision(storage, &command_bytes, erase_armed) {
+            Provision::Stored => return,
+            Provision::EraseArmed => erase_armed = true,
+            Provision::Ignored => {}
         }
     }
 }
 
-/// Handles one console line during provisioning; `true` once the identity is
-/// stored. The key is checked with the scheme's `Crypto::new` first (DEC-294).
+/// Handles one console line during provisioning. The key is checked with the
+/// scheme's `Crypto::new` first (DEC-294). No error path echoes the line: it
+/// may carry the key.
 ///
 /// Out of line, like [`load_identity`], so its temporaries do not sit in the
 /// blockchain task's poll frame under every later blockchain call.
@@ -150,26 +166,37 @@ async fn wait_for_initialization(storage: &mut NodeStorage) {
 fn provision(
     storage: &mut NodeStorage,
     command_bytes: &[u8; rp_usb_console::USB_READ_BUFFER_SIZE],
-) -> bool {
+    erase_armed: bool,
+) -> Provision {
     let Some(trimmed) = command_text(command_bytes) else {
-        return false;
+        log::warn!("The command is not UTF-8");
+        return Provision::Ignored;
     };
+    if trimmed == "/E_" {
+        log::warn!("Erase armed: the next /I_ erases all storage, the stored chain included");
+        return Provision::EraseArmed;
+    }
     if !trimmed.starts_with("/I_") {
-        return false;
+        log::warn!("Not provisioned: only /I_<node_id>_<private_key>_ is accepted");
+        return Provision::Ignored;
+    }
+    if !erase_armed {
+        log::warn!(
+            "The storage holds data this firmware cannot use: flash the firmware that matches it, \
+             or send /E_ to let /I_ erase all storage"
+        );
+        return Provision::Ignored;
     }
     let (Some(node_id_str), Some(key_hex)) = (
         parse_command_parameter(trimmed, 0),
         parse_command_parameter(trimmed, 1),
     ) else {
-        log::warn!(
-            "Received initialization command with insufficient parameters: {}",
-            trimmed
-        );
-        return false;
+        log::warn!("Usage: /I_<node_id>_<private_key_hex>_");
+        return Provision::Ignored;
     };
     let Ok(node_id) = node_id_str.parse::<u32>() else {
-        log::warn!("Failed to parse node_id: {}", node_id_str);
-        return false;
+        log::warn!("The node id must be a decimal u32");
+        return Provision::Ignored;
     };
     if key_hex.len() != 2 * PRIVATE_KEY_SIZE {
         log::warn!(
@@ -177,7 +204,7 @@ fn provision(
             2 * PRIVATE_KEY_SIZE,
             key_hex.len()
         );
-        return false;
+        return Provision::Ignored;
     }
     let mut private_key = [0u8; PRIVATE_KEY_SIZE];
     let key_bytes = key_hex.as_bytes();
@@ -189,54 +216,64 @@ fn provision(
             (Some(h), Some(l)) => *byte = (h << 4) | l,
             _ => {
                 log::warn!("Invalid hex in private key");
-                return false;
+                return Provision::Ignored;
             }
         }
     }
     if Crypto::new(private_key).is_err() {
         log::warn!("The private key is not a valid key for this signature scheme");
-        return false;
+        return Provision::Ignored;
     }
     match storage.init(private_key, node_id, [0u8; INIT_PARAMS_SIZE]) {
         Ok(()) => {
             log::info!("Node {} initialized", node_id);
-            true
+            Provision::Stored
         }
-        Err(_) => {
-            log::error!("Failed to store the node identity");
-            false
+        Err(error) => {
+            log_storage_error("Failed to store the node identity", &error);
+            Provision::Ignored
         }
     }
 }
 
 /// Reads `own_node_id` and the signing key from the control plane and builds
 /// the crypto instance; the key goes straight into it and is not kept (FR68).
-/// `None` (logged) sends the node back to provisioning.
+/// An error (logged) sends the node back to provisioning; it carries whether
+/// `/I_` may erase without an `/E_` confirmation: only an uninitialized
+/// control plane holds nothing to lose.
 ///
 /// Both control-plane reads run here, on Core 0, before the storage moves into
 /// the blockchain, so any replica repair they write happens on the core that
 /// may write flash. Out of line, so the control-plane data (about 2 KB) does
 /// not sit in the blockchain task's poll frame.
 #[inline(never)]
-fn load_identity(storage: &mut NodeStorage) -> Option<(u32, Crypto)> {
+fn load_identity(storage: &mut NodeStorage) -> Result<(u32, Crypto), bool> {
     let own_node_id = match storage.load_control_data() {
         Ok(control) => control.own_node_id,
+        Err(StorageError::ControlPlaneUninitialized) => {
+            log::info!("Node is not initialized; waiting for /I_<node_id>_<private_key>_");
+            return Err(true);
+        }
         Err(error) => {
-            log_load_error(&error);
-            return None;
+            log_storage_error("Control plane unreadable", &error);
+            return Err(false);
         }
     };
-    match storage
-        .load_private_key()
-        .ok()
-        .and_then(|key| Crypto::new(key).ok())
-    {
-        Some(crypto) => Some((own_node_id, crypto)),
-        None => {
+    let key = match storage.load_private_key() {
+        Ok(key) => key,
+        Err(error) => {
+            log_storage_error("Signing key unreadable", &error);
+            return Err(false);
+        }
+    };
+    match Crypto::new(key) {
+        Ok(crypto) => Ok((own_node_id, crypto)),
+        Err(_) => {
             log::error!(
-                "The stored signing key is unusable; waiting for /I_<node_id>_<private_key>_"
+                "The stored signing key is not valid for this firmware's signature scheme: \
+                 flash the matching firmware, or send /E_ then /I_ to re-provision"
             );
-            None
+            Err(false)
         }
     }
 }
@@ -250,21 +287,19 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Logs a control-plane load error by name (`StorageError` has no `Debug`
-/// outside tests).
-fn log_load_error(error: &StorageError) {
+/// Logs a storage error by name (`StorageError` has no `Debug` outside tests),
+/// with what the operator can do.
+fn log_storage_error(context: &str, error: &StorageError) {
     let name = match error {
-        StorageError::ControlPlaneUninitialized => {
-            log::info!("Node is not initialized; waiting for /I_<node_id>_<private_key>_");
-            return;
-        }
         StorageError::BackendIo { code } => {
             log::error!(
-                "Control plane unreadable (BackendIo {}); waiting for /I_<node_id>_<private_key>_",
+                "{} (BackendIo {}): check the flash, or send /E_ then /I_ to erase and re-provision",
+                context,
                 code
             );
             return;
         }
+        StorageError::ControlPlaneUninitialized => "ControlPlaneUninitialized",
         StorageError::ControlPlaneCorrupted => "ControlPlaneCorrupted",
         StorageError::ControlPlaneIncompatible => "ControlPlaneIncompatible",
         StorageError::InvalidIndex => "InvalidIndex",
@@ -274,7 +309,8 @@ fn log_load_error(error: &StorageError) {
         StorageError::InvalidConfiguration => "InvalidConfiguration",
     };
     log::error!(
-        "Control plane unreadable ({}); waiting for /I_<node_id>_<private_key>_",
+        "{} ({}): flash the firmware that matches this node's storage, or send /E_ then /I_ to erase and re-provision",
+        context,
         name
     );
 }
@@ -298,10 +334,10 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
     };
 
     let (own_node_id, crypto) = loop {
-        if let Some(identity) = load_identity(&mut storage) {
-            break identity;
+        match load_identity(&mut storage) {
+            Ok(identity) => break identity,
+            Err(erase_armed) => wait_for_initialization(&mut storage, erase_armed).await,
         }
-        wait_for_initialization(&mut storage).await;
     };
 
     // Unpredictable, as DEC-230 requires (DEC-296).
@@ -335,12 +371,11 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    // First: a Core 0 stack overflow becomes a HardFault (and a reset) instead
-    // of running silently into `.bss`, where the blockchain lives. Core 1 gets
-    // its guard from `spawn_core1`.
-    if embassy_rp::install_core0_stack_guard().is_err() {
-        log::warn!("Core 0 stack guard not installed");
-    }
+    // First: a Core 0 stack overflow becomes a HardFault, which halts the core,
+    // instead of running silently into `.bss`, where the blockchain lives (a
+    // reset needs a watchdog; deferred-work). Core 1 gets its guard from
+    // `spawn_core1`. The result is logged once the console runs.
+    let stack_guard = embassy_rp::install_core0_stack_guard();
     #[cfg(feature = "stack-report")]
     stack_report::paint();
 
@@ -373,6 +408,9 @@ async fn main(spawner: Spawner) {
     debug_indicator.set_low();
 
     log::info!("Starting up");
+    if stack_guard.is_err() {
+        log::warn!("Core 0 stack guard not installed");
+    }
     spawner.spawn(blockchain_task(peripherals.FLASH)).unwrap();
     #[cfg(feature = "stack-report")]
     spawner.spawn(stack_report::report()).unwrap();
@@ -385,15 +423,17 @@ async fn main(spawner: Spawner) {
             continue;
         };
         if !trimmed.starts_with("/G_") {
+            log::warn!("After boot only /G_<initial_total_network_currency>_ is accepted");
             continue;
         }
         match parse_command_parameter(trimmed, 0).map(str::parse::<u64>) {
-            Some(Ok(currency)) => {
+            // A chain with no currency is never what the operator meant.
+            Some(Ok(currency)) if currency > 0 => {
                 LOCAL_COMMANDS
                     .send(LocalCommand::Genesis { currency })
                     .await
             }
-            _ => log::warn!("Usage: /G_<initial_total_network_currency>_"),
+            _ => log::warn!("Usage: /G_<initial_total_network_currency>_ (a positive integer)"),
         }
     }
 }
