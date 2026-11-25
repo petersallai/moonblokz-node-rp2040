@@ -1,0 +1,74 @@
+[package]
+name = "moonblokz-node-rp2040"
+version = "0.1.0"
+edition = "2024"
+
+authors = ["Peter Sallai <peter.sallai@badaccess.eu>"]
+description = "MoonBlokz Node firmware for RP2040-based devices with SX1262 LoRa radio"
+homepage="https://www.moonblokz.com"
+autotests = false
+autobenches = false
+
+[features]
+# The signature scheme of the whole stack (DEC-246), forwarded to the runtime
+# (and through it the blockchain), the storage backend and the crypto module the
+# firmware builds the signing instance with; exactly one, `schnorr` by default.
+# The chain's capacity profile follows it (DEC-254; `src/main.rs`).
+default = ["schnorr"]
+schnorr = ["moonblokz-node-runtime/schnorr", "moonblokz-storage/schnorr", "moonblokz-crypto/schnorr"]
+bls-min-sig = ["moonblokz-node-runtime/bls-min-sig", "moonblokz-storage/bls-min-sig", "moonblokz-crypto/bls-min-sig"]
+bls-min-pk = ["moonblokz-node-runtime/bls-min-pk", "moonblokz-storage/bls-min-pk", "moonblokz-crypto/bls-min-pk"]
+# Paints both cores' stacks and logs their high-water marks, plus a Core 1
+# heartbeat (Story 12.1 AC8). Never in release firmware.
+stack-report = []
+
+[[bin]]
+name = "moonblokz-node-rp2040"
+path = "src/main.rs"
+test = false
+bench = false
+doc = false
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+
+embassy-sync = { version = "0.7"}
+embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread"]}
+embassy-time = { version = "0.5", features = []}
+embassy-futures = { version = "0.1"}
+embassy-rp = { version = "0.8",features = ["unstable-pac", "time-driver", "critical-section-impl", "rp2040"]}
+embassy-usb = { version = "0.5.0" }
+
+lora-phy = { git = "https://github.com/lora-rs/lora-rs.git", default-features = false }
+static_cell = "2.1"
+portable-atomic = { version = "1.13", features = ["critical-section"] }
+
+log = "0.4"
+
+rp-usb-console = { path="../rp-usb-console" }
+moonblokz-radio-lib = { path = "../moonblokz-radio-lib", default-features = false, features = ["radio-device-rp-lora-sx1262","memory-config-medium","connection-matrix-logging"] }
+moonblokz-node-runtime = { path = "../moonblokz-node-runtime", default-features = false, features = ["block-size-2016"] }
+moonblokz-crypto = { path = "../moonblokz-crypto-lib", default-features = false }
+# The node is the binary, so it is the one place a storage backend is chosen.
+moonblokz-storage = { path="../moonblokz-storage", default-features = false, features = ["backend-rp2040", "block-size-2016"] }
+
+rp2040-hal = { version = "0.11"}
+
+[profile.release]
+lto = true
+opt-level = "z"
+incremental = false
+codegen-units = 1
+# note: debug = true is okay - debuginfo isn't flashed to the device!
+debug = true
+panic = "abort"
+
+[profile.dev]
+lto = true
+opt-level = "z"
+incremental = false
+codegen-units = 1
+# note: debug = true is okay - debuginfo isn't flashed to the device!
+debug = true
+panic = "abort"
