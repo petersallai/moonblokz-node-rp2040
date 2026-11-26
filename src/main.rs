@@ -63,7 +63,9 @@ const MAX_NODES: usize = 211;
 const SNAKE_CHAIN_LENGTH_MAX: u32 = 500;
 const MAX_BLOCKS: usize = 600;
 const MAX_BRANCH_COUNT: usize = 40;
-const MAX_BLOCK_UTXO_OUTPUT: usize = 256;
+/// The available-UTXO bitfield in bytes (DEC-318): 32 UTXO outputs per block,
+/// the chain default `max_block_utxo_output`. A chain declaring more is refused.
+const AVAILABLE_UTXO_BYTES: usize = 4;
 
 // Core 1 runs the USB console (later the radio) on its own stack; the
 // blockchain task runs on Core 0's main stack (DEC-289). Measured with the
@@ -356,7 +358,7 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
         SNAKE_CHAIN_LENGTH_MAX,
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
-        MAX_BLOCK_UTXO_OUTPUT,
+        AVAILABLE_UTXO_BYTES,
     >(
         crypto,
         &mut storage,
