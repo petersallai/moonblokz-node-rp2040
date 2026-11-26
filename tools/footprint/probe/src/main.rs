@@ -66,7 +66,8 @@ impl StorageTrait for Opaque {
 
 /// The scheme's node capacity (`MAX_NODES`), the profile's one lever: the
 /// largest count whose blockchain static RAM (about 58.5 / 57.8 / 60.0 KB
-/// plus 50 / 114 / 66 B a node), its Core 1 stack and the rest of system
+/// plus 50 / 114 / 66 B a node, before Story 7.1's 4-byte bitfield took
+/// 16.8 KB off the block table, DEC-318), its Core 1 stack and the rest of system
 /// constraints §3.2 fit 264 KB (Story 6.17, DEC-254; re-fitted by Story 6.6
 /// for the approval accumulator, and by Story 6.7 for `bls-min-sig`'s Core 1
 /// of 57 KiB, DEC-263), and by Story 12.1 against the node's own build (the
@@ -97,7 +98,8 @@ type Chain = moonblokz_blockchain::Blockchain<
     500,
     600,
     40,
-    256,
+    // `AVAILABLE_UTXO_BYTES` (DEC-318), in step with the node's `src/main.rs`.
+    4,
 >;
 
 #[cfg(feature = "with-chain")]
