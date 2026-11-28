@@ -43,8 +43,9 @@ LIVE = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 # The 264 KB inequality (system constraints §3.2, Story 6.17 AC3): what the probe and
 # the node measure, plus the rows that are not linked or measured yet. Estimates.
 RAM_LIMIT = 264 * 1024
+# The mempool is a field of the blockchain since Story 7.3 (DEC-351): measured
+# inside the task's pool, so it has no row of its own.
 ESTIMATED_ROWS = {
-    "mempool (not linked yet)": 24883,     # about 24.3 KB
     "radio-lib memory-config-medium": 60 * 1024,
     "crypto-lib scratch": 4 * 1024,
     # The former 18 KiB "other task stacks" less the 8 KiB CORE1_STACK that

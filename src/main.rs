@@ -66,6 +66,11 @@ const MAX_BRANCH_COUNT: usize = 40;
 /// The available-UTXO bitfield in bytes (DEC-318): 32 UTXO outputs per block,
 /// the chain default `max_block_utxo_output`. A chain declaring more is refused.
 const AVAILABLE_UTXO_BYTES: usize = 4;
+/// The mempool (Story 7.3, DEC-351): a 20 160 B compacted buffer and 128
+/// index entries — system-constraints §1's `MEMPOOL_COMPACT_BYTES` /
+/// `MEMPOOL_MAX_ENTRIES`, inside its 24 883 B reservation.
+const MEMPOOL_COMPACT_BYTES: usize = 20_160;
+const MEMPOOL_MAX_ENTRIES: usize = 128;
 
 // Core 1 runs the USB console (later the radio) on its own stack; the
 // blockchain task runs on Core 0's main stack (DEC-289). Measured with the
@@ -359,6 +364,8 @@ async fn blockchain_task(flash: Peri<'static, FLASH>) {
         MAX_BLOCKS,
         MAX_BRANCH_COUNT,
         AVAILABLE_UTXO_BYTES,
+        MEMPOOL_COMPACT_BYTES,
+        MEMPOOL_MAX_ENTRIES,
     >(
         crypto,
         &mut storage,
