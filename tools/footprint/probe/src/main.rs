@@ -100,6 +100,9 @@ type Chain = moonblokz_blockchain::Blockchain<
     40,
     // `AVAILABLE_UTXO_BYTES` (DEC-318), in step with the node's `src/main.rs`.
     4,
+    // The mempool's capacities (DEC-351), in step with the node's `src/main.rs`.
+    20_160,
+    128,
 >;
 
 #[cfg(feature = "with-chain")]
